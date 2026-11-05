@@ -1,0 +1,2 @@
+# Room links (/r/<id>) are handled by the single-page app.
+/r/*  /index.html  200

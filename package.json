@@ -1,0 +1,19 @@
+{
+  "name": "ppfileshare",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "web",
+    "signaling"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n sig,web -c magenta,cyan \"npm run dev -w signaling\" \"npm run dev -w web\"",
+    "dev:lan": "concurrently -k -n sig,web -c magenta,cyan \"npm run dev -w signaling\" \"npm run dev:lan -w web\"",
+    "build": "npm run build -w web",
+    "check": "npm run check -w web",
+    "start": "npm run start -w signaling"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.6"
+  }
+}
