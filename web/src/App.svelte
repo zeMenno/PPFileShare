@@ -2,11 +2,13 @@
   import { parseRoomLink } from './lib/engine/join';
   import HostView from './lib/ui/HostView.svelte';
   import JoinView from './lib/ui/JoinView.svelte';
+  import { layout } from './lib/ui/layout.svelte';
+  import WatchView from './lib/ui/WatchView.svelte';
 
   const link = parseRoomLink();
 </script>
 
-<div class="shell">
+<div class="shell" class:wide={layout.wide}>
   <header>
     <a class="brand" href="/" aria-label="P2P File Share home">
       <img src="/favicon.svg" alt="" width="26" height="26" />
@@ -15,7 +17,9 @@
   </header>
 
   <main>
-    {#if link}
+    {#if link?.kind === 'watch'}
+      <WatchView {link} />
+    {:else if link}
       <JoinView {link} />
     {:else}
       <HostView />
@@ -23,7 +27,7 @@
   </main>
 
   <footer class="muted small">
-    Files travel straight between browsers, end-to-end encrypted. Nothing is uploaded or stored.
+    Everything travels straight between browsers, end-to-end encrypted. Nothing is uploaded or stored.
   </footer>
 </div>
 
@@ -36,6 +40,10 @@
     display: flex;
     flex-direction: column;
     gap: 24px;
+  }
+
+  .shell.wide {
+    max-width: 1240px;
   }
 
   .brand {

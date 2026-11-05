@@ -10,15 +10,22 @@ import {
   AAD_PEER,
   aadSignal,
   chooseChunkSize,
+  cleanName,
+  MAX_CHAT_LENGTH,
+  type ChatMessage,
   type FileMeta,
   type HostMsg,
   type PeerMsg,
+  type PlaybackAction,
+  type RoomKind,
   type SignalMsg,
+  type WatchState,
 } from './protocol';
-import { SignalingClient, type ServerMsg } from './signaling';
+import { createSignaling, type ServerMsg, type Signaling } from './signaling';
 import { SpeedMeter } from './speed';
 
 export interface HostOptions {
+  kind: RoomKind;
   password?: string;
   requireApproval: boolean;
   closeAfterFirstDownload: boolean;
@@ -63,7 +70,17 @@ export interface HostSnapshot {
   hasPassword: boolean;
   options: HostOptions;
   transferring: boolean;
+  kind: RoomKind;
+  watch: WatchState;
+  chat: ChatMessage[];
 }
+
+/** Video bitrate cap per viewer; WebRTC adapts below this to what the network allows. */
+const VIDEO_MAX_BITRATE = 8_000_000;
+const AUDIO_MAX_BITRATE = 256_000;
+const CHAT_HISTORY = 200;
+
+const EMPTY_WATCH: WatchState = { source: null, title: '', playing: false, time: 0, duration: 0, rate: 1 };
 
 interface SharedFile {
   meta: FileMeta;
@@ -78,6 +95,14 @@ interface Range {
 
 const HELLO_TIMEOUT_MS = 20_000;
 const GIVE_UP_AFTER_DROP_MS = 30_000;
+
+function formatClock(seconds: number) {
+  const s = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(s / 3600);
+  const mm = String(Math.floor((s % 3600) / 60)).padStart(h ? 2 : 1, '0');
+  const ss = String(s % 60).padStart(2, '0');
+  return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
 
 export function cleanPath(path: string, fallback: string): string {
   const parts = path
@@ -96,7 +121,7 @@ export class HostRoom extends Observable<HostSnapshot> {
 
   #options: HostOptions;
   #token = randomId(16);
-  #sig: SignalingClient | null = null;
+  #sig: Signaling | null = null;
   #status: RoomStatus = 'connecting';
   #closedReason?: string;
   #peers = new Map<string, HostPeer>();
@@ -107,6 +132,14 @@ export class HostRoom extends Observable<HostSnapshot> {
   #pendingCreate: { resolve: () => void; reject: (e: Error) => void } | null = null;
   /** Pre-sealed "bye" so we can still send it synchronously while the page unloads. */
   byeFrame: Bytes | null = null;
+
+  // Watch-together state
+  readonly kind: RoomKind;
+  media: { video: MediaStreamTrack | null; audio: MediaStreamTrack | null } = { video: null, audio: null };
+  #watch: WatchState = { ...EMPTY_WATCH };
+  #chat: ChatMessage[] = [];
+  /** Called when a viewer presses play/pause or seeks; the UI applies it to the player. */
+  onControl: ((action: PlaybackAction, time: number | undefined, who: string) => void) | null = null;
 
   static async create(options: HostOptions): Promise<HostRoom> {
     const linkKey = newLinkKey();
@@ -126,7 +159,8 @@ export class HostRoom extends Observable<HostSnapshot> {
     this.roomId = roomId;
     this.key = key;
     this.#options = { ...options };
-    const frag = `k=${linkKey}${options.password ? '&p=1' : ''}`;
+    this.kind = options.kind;
+    const frag = `k=${linkKey}${options.password ? '&p=1' : ''}${options.kind === 'watch' ? '&m=w' : ''}`;
     this.link = `${location.origin}/r/${roomId}#${frag}`;
   }
 
@@ -152,7 +186,70 @@ export class HostRoom extends Observable<HostSnapshot> {
       hasPassword: !!this.#options.password,
       options: { ...this.#options, password: undefined },
       transferring: [...this.#peers.values()].some((p) => p.isSending),
+      kind: this.kind,
+      watch: { ...this.#watch },
+      chat: this.#chat,
     };
+  }
+
+  // ---------------------------------------------------------------- watch together
+
+  /** Swap the video/audio being streamed. Works mid-session without renegotiating. */
+  setMedia(video: MediaStreamTrack | null, audio: MediaStreamTrack | null) {
+    if (video && 'contentHint' in video) video.contentHint = 'motion';
+    this.media = { video, audio };
+    for (const p of this.#peers.values()) p.applyMedia();
+  }
+
+  /** Update what viewers see in their player bar (position, paused, title…). */
+  setWatchState(state: Partial<WatchState>) {
+    this.#watch = { ...this.#watch, ...state };
+    for (const p of this.#peers.values()) p.sendWatch(this.#watch);
+    this.changed();
+  }
+
+  get watchState(): WatchState {
+    return { ...this.#watch };
+  }
+
+  /** Initial state for a viewer that just connected. */
+  greet(peer: HostPeer) {
+    if (this.kind !== 'watch') return;
+    peer.sendWatch(this.#watch);
+    if (this.#chat.length) peer.sendChat(this.#chat.slice(-50));
+    this.#postChat({ from: peer.name, text: 'joined', system: true });
+  }
+
+  sendChat(text: string) {
+    this.#postChat({ from: 'Host', text });
+  }
+
+  peerChat(peer: HostPeer, text: string) {
+    this.#postChat({ from: peer.name, text });
+  }
+
+  peerRenamed(peer: HostPeer, name: string) {
+    const old = peer.name;
+    peer.name = cleanName(name);
+    if (old !== peer.name && peer.isLive) this.#postChat({ from: old, text: `is now ${peer.name}`, system: true });
+    this.changed();
+  }
+
+  peerControl(peer: HostPeer, action: PlaybackAction, time: number | undefined) {
+    if (this.kind !== 'watch' || this.#watch.source !== 'file') return;
+    if (action === 'seek' && !(typeof time === 'number' && Number.isFinite(time))) return;
+    this.onControl?.(action, time, peer.name);
+    const what = action === 'seek' ? `skipped to ${formatClock(time!)}` : action === 'play' ? 'pressed play' : 'paused';
+    this.#postChat({ from: peer.name, text: what, system: true });
+  }
+
+  #postChat(m: Omit<ChatMessage, 'id' | 'at'>) {
+    const text = String(m.text ?? '').slice(0, MAX_CHAT_LENGTH).trim();
+    if (!text) return;
+    const msg: ChatMessage = { ...m, text, id: randomId(6), at: Date.now() };
+    this.#chat = [...this.#chat, msg].slice(-CHAT_HISTORY);
+    for (const p of this.#peers.values()) p.sendChat([msg]);
+    this.changed();
   }
 
   /** Lets peers ask for a UI refresh. */
@@ -232,6 +329,8 @@ export class HostRoom extends Observable<HostSnapshot> {
   }
 
   removePeer(peer: HostPeer) {
+    if (!this.#peers.has(peer.id)) return;
+    if (this.kind === 'watch' && peer.isLive) this.#postChat({ from: peer.name, text: 'left', system: true });
     peer.dispose();
     this.#peers.delete(peer.id);
     this.changed();
@@ -246,7 +345,7 @@ export class HostRoom extends Observable<HostSnapshot> {
   // ---------------------------------------------------------------- signaling
 
   async #connectSignaling() {
-    const sig = new SignalingClient(config.signalingUrl);
+    const sig = createSignaling();
     sig.on('message', (m) => this.#onServer(m));
     sig.on('close', () => this.#onSignalingLost(sig));
     await sig.connect();
@@ -264,7 +363,7 @@ export class HostRoom extends Observable<HostSnapshot> {
     this.changed();
   }
 
-  #onSignalingLost(sig: SignalingClient) {
+  #onSignalingLost(sig: Signaling) {
     if (this.#sig !== sig || this.#status === 'closed') return;
     this.#sig = null;
     this.#status = 'reconnecting';
@@ -423,11 +522,48 @@ class HostPeer {
   #dropTimer?: ReturnType<typeof setTimeout>;
   #restartTimer?: ReturnType<typeof setTimeout>;
   #disposed = false;
+  #videoTx: RTCRtpTransceiver | null = null;
+  #audioTx: RTCRtpTransceiver | null = null;
 
   constructor(
     private readonly room: HostRoom,
     readonly id: string,
   ) {}
+
+  // ---------------------------------------------------------------- watch together
+
+  applyMedia() {
+    if (this.#disposed) return;
+    const { video, audio } = this.room.media;
+    this.#videoTx?.sender.replaceTrack(video).catch((e) => console.warn('replaceTrack(video) failed', e));
+    this.#audioTx?.sender.replaceTrack(audio).catch((e) => console.warn('replaceTrack(audio) failed', e));
+    if (this.isLive) this.#tuneSenders();
+  }
+
+  /** Raise WebRTC's conservative default bitrates; it still adapts down on slow links. */
+  async #tuneSenders() {
+    const tune = async (tx: RTCRtpTransceiver | null, maxBitrate: number) => {
+      if (!tx) return;
+      try {
+        const params = tx.sender.getParameters();
+        if (!params.encodings?.length) return;
+        params.encodings[0].maxBitrate = maxBitrate;
+        await tx.sender.setParameters(params);
+      } catch (e) {
+        console.warn('could not tune sender', e);
+      }
+    };
+    await tune(this.#videoTx, VIDEO_MAX_BITRATE);
+    await tune(this.#audioTx, AUDIO_MAX_BITRATE);
+  }
+
+  sendWatch(state: WatchState) {
+    if (this.isLive) this.#sendCtrl({ t: 'watch', state });
+  }
+
+  sendChat(messages: ChatMessage[]) {
+    if (this.isLive) this.#sendCtrl({ t: 'chat', messages });
+  }
 
   get isLive() {
     return this.status === 'connected' || this.status === 'reconnecting';
@@ -468,6 +604,14 @@ class HostPeer {
       dc.onbufferedamountlow = () => this.pump();
       dc.onopen = () => this.pump();
       this.#data.push(dc);
+    }
+
+    if (this.room.kind === 'watch') {
+      // Fixed send-only slots for video and audio, so the host can switch videos
+      // (or start/stop screen sharing) with replaceTrack and no renegotiation.
+      this.#videoTx = pc.addTransceiver('video', { direction: 'sendonly' });
+      this.#audioTx = pc.addTransceiver('audio', { direction: 'sendonly' });
+      this.applyMedia();
     }
 
     pc.onicecandidate = (ev) => {
@@ -544,6 +688,8 @@ class HostPeer {
     this.#chunkSize = chooseChunkSize(this.#pc?.sctp?.maxMessageSize, config.maxChunkSize, config.minChunkSize);
     this.status = 'connected';
     this.sendManifest();
+    this.room.greet(this);
+    this.#tuneSenders();
     this.room.notify();
   }
 
@@ -634,6 +780,17 @@ class HostPeer {
       }
       case 'finished':
         this.room.peerFinished();
+        return;
+      case 'control':
+        if (msg.action === 'play' || msg.action === 'pause' || msg.action === 'seek') {
+          this.room.peerControl(this, msg.action, typeof msg.time === 'number' ? msg.time : undefined);
+        }
+        return;
+      case 'chat':
+        this.room.peerChat(this, String(msg.text ?? ''));
+        return;
+      case 'name':
+        this.room.peerRenamed(this, msg.name);
         return;
     }
   }

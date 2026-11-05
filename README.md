@@ -1,8 +1,13 @@
 # P2P File Share
 
-A personal, browser-only file share. Open a room, drop files in, share the link, and
-whoever opens it downloads straight from your browser. No accounts, no database, no
-uploads. The server only introduces the two browsers to each other.
+A personal, browser-only file share, plus a watch-together mode. Open a room, drop files in
+(or pick a video), share the link, and whoever opens it connects straight to your browser.
+No accounts, no uploads. The server only introduces the browsers to each other.
+
+- **Share files:** joiners download directly from your tab.
+- **Watch together:** you pick a video file (or share a tab/screen); it plays for everyone
+  live over WebRTC, with sound. Anyone can play, pause and seek, and there's a chat. Viewers
+  don't need the file.
 
 - **Peer to peer.** File bytes only travel between the two browsers (WebRTC data channels).
 - **No auth.** The unguessable link is the access control; the host approves each joiner.
@@ -18,8 +23,10 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173, click **New room**, then open the link in another tab or browser.
-`npm run dev` starts the signaling server on :8787 and Vite on :5173 (Vite proxies `/ws`).
+Open http://localhost:5173, click **Share files** or **Watch together**, then open the link in
+another tab or browser. `npm run dev` starts the signaling server on :8787 and Vite on :5173
+(Vite proxies `/ws`). `npm run dev:http` runs only Vite, using the same HTTP polling signaling
+as the Vercel deployment (with an in-memory store instead of Redis).
 
 ### Testing on your phone
 
@@ -81,6 +88,26 @@ npm run test -w signaling
   corruption, truncation and reordering, so there is no separate whole-file hash: WebCrypto
   can't hash a stream, and hashing up front would mean reading every file twice.
 
+### Watch together
+
+- The host's `<video>` plays the chosen file locally; `captureStream()` turns it into live
+  video and audio tracks, which go to every viewer over their own RTCPeerConnection. Sharing a
+  tab or screen uses `getDisplayMedia()` instead.
+- Each connection has fixed send-only video and audio slots, so switching videos or
+  starting/stopping screen sharing is a `replaceTrack`, with no renegotiation.
+- Bitrate caps are raised to 8 Mbit/s video and 256 kbit/s stereo Opus (the viewer's answer asks
+  for stereo); WebRTC still adapts down on slow links.
+- Play, pause and seek from a viewer go to the host over the encrypted control channel; the host
+  applies them to its player and broadcasts the new position. Viewers extrapolate the position
+  between updates for their progress bar. Chat goes through the host the same way.
+- Media is DTLS-SRTP encrypted between the browsers. The DTLS fingerprints travel inside
+  signaling messages sealed with the room key, so the signaling server can't swap them and
+  sit in the middle.
+- Limits: the host needs Chrome, Edge or Firefox (Safari can't capture a video element); viewers
+  can use any modern browser. Each viewer gets their own encoded stream, so a laptop host is
+  comfortable with a handful of viewers, not dozens. Keep the host tab visible: some browsers
+  slow down video decoding in background tabs.
+
 ### Resilience
 
 - Network change (Wi-Fi to 4G): the host tries an ICE restart. If that doesn't recover within
@@ -109,7 +136,22 @@ npm run test -w signaling
 
 ## Deploy
 
-**Option A: one Node process** (simplest). The signaling server also serves `web/dist`.
+**On Vercel.** Vercel functions can't hold WebSockets, so on Vercel the app uses HTTP polling
+signaling instead: `api/signal.ts` keeps rooms and mailboxes in Upstash Redis with ~30-60 s
+expiry (only sealed ciphertext is stored, and it disappears on its own). The client polls from a
+Web Worker every 0.5 s during a handshake and every 2.5 s otherwise; builds on Vercel switch to
+this mode automatically.
+
+1. Import the GitHub repo in Vercel (or `vercel link` + `vercel deploy --prod`). `vercel.json`
+   sets the build, output folder, room-link rewrite and security headers.
+2. In the project's **Storage** tab, create an **Upstash for Redis** database (free tier) and
+   connect it to the project. It adds `KV_REST_API_URL` / `KV_REST_API_TOKEN`.
+3. Redeploy so the function picks up those variables.
+
+Each open room costs a few Redis commands per poll (roughly 7k commands per hour for an idle
+host), so check Upstash's free-tier limits if you leave rooms open for long.
+
+**Option A: one Node process** (simplest self-hosting). The signaling server also serves `web/dist`.
 
 ```bash
 npm ci && npm run build
@@ -155,15 +197,19 @@ encrypted end to end).
 ## Project layout
 
 ```
-signaling/server.js        rooms in memory, relay, limits, optional static hosting
+api/signal.ts              Vercel function: HTTP polling signaling
+api/_lib/signal-core.ts    room protocol over a key-value store (+ in-memory store for dev)
+api/_lib/store-upstash.ts  Upstash Redis store
+signaling/server.js        WebSocket signaling: rooms in memory, limits, optional static hosting
 signaling/test.js          smoke test for the room protocol
 web/src/lib/engine/        transfer engine (framework-free)
-  host.ts                  HostRoom: files, approvals, per-peer sender with backpressure
-  join.ts                  JoinRoom: connection state machine, range requests, resume
+  host.ts                  HostRoom: files, media tracks, approvals, per-peer sender
+  join.ts                  JoinRoom: connection state machine, range requests, resume, media
+  signaling.ts             WebSocket and HTTP-polling transports (signalWorker.ts polls)
   worker.ts                file reading + AES-GCM off the main thread
   crypto.ts protocol.ts    keys, sealing, frame format, message types
   sinks.ts                 File System Access / service-worker stream / Blob writers
-web/src/lib/ui/            Svelte views (HostView, JoinView)
+web/src/lib/ui/            Svelte views (HostView, JoinView, WatchHost, WatchView, Chat)
 web/public/sw.js           streaming-download service worker
 ```
 
@@ -171,3 +217,4 @@ web/public/sw.js           streaming-download service worker
 
 From the plan's nice-to-haves: two-way rooms (joiner adds files) and resume across a page
 reload (OPFS buffering). Resume after a dropped connection within the same page works.
+For watch-together: subtitles, and a relay (SFU) for larger audiences.

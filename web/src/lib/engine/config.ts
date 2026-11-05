@@ -19,9 +19,17 @@ function signalingUrl(): string {
   return `${proto}//${location.host}/ws`;
 }
 
+function signalingMode(): 'ws' | 'http' {
+  const mode = (import.meta.env.VITE_SIGNALING_MODE as string | undefined) || __DEFAULT_SIGNALING_MODE__;
+  return mode === 'http' ? 'http' : 'ws';
+}
+
 export const config = {
   iceServers: iceServers(),
+  /** "ws" for the Node server, "http" for polling (serverless hosts like Vercel). */
+  signalingMode: signalingMode(),
   signalingUrl: signalingUrl(),
+  signalingHttpUrl: (import.meta.env.VITE_SIGNALING_HTTP_URL as string | undefined) || '/api/signal',
   /** Give up on a direct connection after this long and say so. */
   connectTimeoutMs: 15_000,
   /** Largest chunk we ever send; the real size also respects the SCTP max message size. */

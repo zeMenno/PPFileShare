@@ -25,6 +25,31 @@ export interface FileMeta {
   lastModified: number;
 }
 
+/** "files" rooms share files; "watch" rooms stream a video to everyone. */
+export type RoomKind = 'files' | 'watch';
+
+export interface WatchState {
+  /** What the host is streaming: a video file (seekable) or a tab/screen (live). */
+  source: 'file' | 'screen' | null;
+  title: string;
+  playing: boolean;
+  /** Playback position in seconds when the host sent this. */
+  time: number;
+  duration: number;
+  rate: number;
+}
+
+export interface ChatMessage {
+  id: string;
+  from: string;
+  text: string;
+  at: number;
+  /** "Alice joined", "Bob paused", … */
+  system?: boolean;
+}
+
+export type PlaybackAction = 'play' | 'pause' | 'seek';
+
 export type SignalMsg =
   | { t: 'hello'; clientId: string; name: string }
   | { t: 'welcome' }
@@ -35,13 +60,24 @@ export type SignalMsg =
 export type HostMsg =
   | { t: 'manifest'; files: FileMeta[]; chunkSize: number }
   | { t: 'error'; file?: number; message: string }
+  | { t: 'watch'; state: WatchState }
+  | { t: 'chat'; messages: ChatMessage[] }
   | { t: 'bye' };
 
 export type PeerMsg =
   | { t: 'want'; file: number; from: number; to: number }
   | { t: 'cancel'; file: number }
   | { t: 'complete'; file: number }
-  | { t: 'finished' };
+  | { t: 'finished' }
+  | { t: 'control'; action: PlaybackAction; time?: number }
+  | { t: 'chat'; text: string }
+  | { t: 'name'; name: string };
+
+export const MAX_CHAT_LENGTH = 500;
+
+export function cleanName(name: unknown, fallback = 'Someone'): string {
+  return String(name ?? '').replace(/[\u0000-\u001f]/g, '').trim().slice(0, 40) || fallback;
+}
 
 export const FRAME_VERSION = 1;
 export const HEADER_BYTES = 16;

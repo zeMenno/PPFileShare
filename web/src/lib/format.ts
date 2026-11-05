@@ -23,6 +23,16 @@ export function formatEta(remaining: number, bytesPerSecond: number): string {
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m left`;
 }
 
+/** 75 → "1:15", 3725 → "1:02:05". */
+export function formatClock(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
+  const s = Math.floor(seconds);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = String(s % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`;
+}
+
 export function plural(n: number, one: string, many = `${one}s`) {
   return `${n} ${n === 1 ? one : many}`;
 }

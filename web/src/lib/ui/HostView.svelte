@@ -3,13 +3,19 @@
   import { filesFromDrop, filesFromInput } from '../pickFiles';
   import { formatBytes, formatSpeed, plural } from '../format';
   import { keepAwake, wakeLockSupported } from '../wakeLock';
+  import type { RoomKind } from '../engine/protocol';
+  import Icon from './Icon.svelte';
+  import { layout } from './layout.svelte';
   import Progress from './Progress.svelte';
   import QrCode from './QrCode.svelte';
+  import WatchHost from './WatchHost.svelte';
 
   let room = $state.raw<HostRoom | null>(null);
   let snap = $state.raw<HostSnapshot | null>(null);
-  let creating = $state(false);
+  let creating = $state<RoomKind | null>(null);
   let error = $state('');
+  /** A video dropped on the page while hosting a watch room. */
+  let droppedVideo = $state<File | null>(null);
 
   // Room options (before creating)
   let usePassword = $state(false);
@@ -37,19 +43,24 @@
     document.title = pending.length ? `(${pending.length}) Someone wants to join · P2P File Share` : 'P2P File Share';
   });
 
-  async function createRoom(initial: FileInput[] = []) {
+  $effect(() => {
+    layout.wide = snap?.kind === 'watch' && snap.status !== 'closed';
+  });
+
+  async function createRoom(kind: RoomKind, initial: FileInput[] = []) {
     if (creating) return;
     if (usePassword && !password) {
       error = 'Enter a password, or turn the password option off.';
       return;
     }
-    creating = true;
+    creating = kind;
     error = '';
     try {
       const r = await HostRoom.create({
+        kind,
         password: usePassword ? password : undefined,
         requireApproval,
-        closeAfterFirstDownload: closeAfterFirst,
+        closeAfterFirstDownload: kind === 'files' && closeAfterFirst,
       });
       r.on('change', (s) => (snap = s));
       if (initial.length) r.addFiles(initial);
@@ -59,14 +70,15 @@
     } catch (e) {
       error = (e as Error).message || 'Could not open a room.';
     } finally {
-      creating = false;
+      creating = null;
     }
   }
 
   function addFiles(list: FileInput[]) {
     if (!list.length) return;
-    if (room && live) room.addFiles(list);
-    else createRoom(list);
+    if (room && live && snap?.kind === 'watch') droppedVideo = list[0].file;
+    else if (room && live) room.addFiles(list);
+    else createRoom('files', list);
   }
 
   function newRoom() {
@@ -151,7 +163,7 @@
   ondragleave={onDragLeave}
   ondrop={onDrop}
   onbeforeunload={onBeforeUnload}
-  onpagehide={() => room?.sayGoodbye()}
+  onpagehide={() => room?.close('The host left.')}
 />
 
 <input bind:this={fileInput} type="file" multiple hidden onchange={onInput} />
@@ -159,25 +171,30 @@
 
 {#if dragging}
   <div class="drop-overlay" aria-hidden="true">
-    <div>Drop to share</div>
+    <div>{snap?.kind === 'watch' ? 'Drop to play for everyone' : 'Drop to share'}</div>
   </div>
 {/if}
 
 {#if !snap}
   <section class="stack hero">
     <div class="stack intro">
-      <h1>Send files straight from your browser.</h1>
+      <h1>Share files and watch together, straight from your browser.</h1>
       <p class="muted lead">
-        Open a room, drop in files and share the link. Whoever opens it downloads directly from this tab:
-        no uploads, no accounts, end-to-end encrypted.
+        Open a room and share the link. Whoever opens it connects directly to this tab: no uploads, no accounts,
+        end-to-end encrypted.
       </p>
     </div>
 
     <div class="card stack">
-      <button class="primary big" onclick={() => createRoom()} disabled={creating}>
-        {#if creating}<span class="spinner small-spin"></span> Opening room…{:else}New room{/if}
-      </button>
-      <p class="muted small center">…or drop files anywhere on this page.</p>
+      <div class="choices">
+        <button class="primary big" onclick={() => createRoom('files')} disabled={!!creating}>
+          {#if creating === 'files'}<span class="spinner small-spin"></span> Opening room…{:else}Share files{/if}
+        </button>
+        <button class="big" onclick={() => createRoom('watch')} disabled={!!creating}>
+          {#if creating === 'watch'}<span class="spinner small-spin dark"></span> Opening room…{:else}<Icon name="film" /> Watch together{/if}
+        </button>
+      </div>
+      <p class="muted small center">Drop files anywhere on this page to start sharing right away.</p>
 
       <details class="options">
         <summary>Room options</summary>
@@ -195,7 +212,7 @@
           {/if}
           <label class="toggle">
             <input type="checkbox" bind:checked={closeAfterFirst} />
-            <span>Close the room after the first download</span>
+            <span>Close the room after the first download<br /><span class="muted small">File rooms only.</span></span>
           </label>
         </div>
       </details>
@@ -205,8 +222,8 @@
 
     <ol class="how muted small">
       <li><strong>Open a room.</strong> Your browser makes a random link and key.</li>
-      <li><strong>Add files.</strong> They stay on your disk; nothing is uploaded.</li>
-      <li><strong>Share the link.</strong> The joiner's browser connects straight to yours.</li>
+      <li><strong>Add files or pick a video.</strong> They stay on your disk; nothing is uploaded.</li>
+      <li><strong>Share the link.</strong> Their browser connects straight to yours: they download the files, or watch the video with you in sync.</li>
       <li><strong>Close the tab</strong> and the room is gone.</li>
     </ol>
   </section>
@@ -231,9 +248,13 @@
       </div>
     {/each}
 
+    {#if snap.kind === 'watch' && room}
+      <WatchHost {room} {snap} bind:incoming={droppedVideo} />
+    {/if}
+
     <div class="card stack">
       <div class="row wrap">
-        <h2>Share this link</h2>
+        <h2>{snap.kind === 'watch' ? 'Invite people' : 'Share this link'}</h2>
         <span class="spacer"></span>
         {#if snap.status === 'open'}
           <span class="pill ok">Room open</span>
@@ -253,11 +274,12 @@
         <div class="qr-wrap"><QrCode value={snap.link} /></div>
       {/if}
       <p class="muted small">
-        Anyone with the full link can {snap.options.requireApproval ? 'ask to join' : 'download'}. Share it like a password.
+        Anyone with the full link can {snap.options.requireApproval ? 'ask to join' : snap.kind === 'watch' ? 'watch' : 'download'}. Share it like a password.
         {#if snap.hasPassword}This room also needs the password you set; send that separately.{/if}
       </p>
     </div>
 
+    {#if snap.kind === 'files'}
     <div class="card stack files-card" class:empty={!snap.files.length}>
       <div class="row wrap">
         <h2>Files</h2>
@@ -291,6 +313,7 @@
         </ul>
       {/if}
     </div>
+    {/if}
 
     <div class="card stack">
       <div class="row">
@@ -339,18 +362,24 @@
         />
         <span>Ask me before someone joins</span>
       </label>
-      <label class="toggle">
-        <input
-          type="checkbox"
-          checked={snap.options.closeAfterFirstDownload}
-          onchange={(e) => room?.setOption('closeAfterFirstDownload', e.currentTarget.checked)}
-        />
-        <span>Close the room after the first download</span>
-      </label>
+      {#if snap.kind === 'files'}
+        <label class="toggle">
+          <input
+            type="checkbox"
+            checked={snap.options.closeAfterFirstDownload}
+            onchange={(e) => room?.setOption('closeAfterFirstDownload', e.currentTarget.checked)}
+          />
+          <span>Close the room after the first download</span>
+        </label>
+      {/if}
     </div>
 
     <div class="notice small">
-      Keep this tab open while people download: files go straight from this browser to theirs.
+      {#if snap.kind === 'watch'}
+        Keep this tab open: the video streams straight from this browser to everyone watching.
+      {:else}
+        Keep this tab open while people download: files go straight from this browser to theirs.
+      {/if}
       {#if connectedCount > 0 && wakeLockSupported}The screen stays on while someone is connected.{/if}
     </div>
 
@@ -364,6 +393,23 @@
 <style>
   .hero {
     gap: 28px;
+  }
+
+  .choices {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+
+  @media (max-width: 480px) {
+    .choices {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  .small-spin.dark {
+    border-color: var(--border);
+    border-top-color: var(--accent);
   }
 
   .intro {

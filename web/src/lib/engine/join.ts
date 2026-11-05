@@ -6,8 +6,22 @@ import { config } from './config';
 import { deriveRoomKey, fromB64u, openJson, randomId, sealJson, toB64u } from './crypto';
 import { CryptoWorker } from './cryptoWorker';
 import { Observable } from './emitter';
-import { AAD_HOST, AAD_PEER, aadSignal, type FileMeta, type HostMsg, type PeerMsg, type SignalMsg } from './protocol';
-import { SignalingClient, type ServerMsg } from './signaling';
+import {
+  AAD_HOST,
+  AAD_PEER,
+  aadSignal,
+  cleanName,
+  MAX_CHAT_LENGTH,
+  type ChatMessage,
+  type FileMeta,
+  type HostMsg,
+  type PeerMsg,
+  type PlaybackAction,
+  type RoomKind,
+  type SignalMsg,
+  type WatchState,
+} from './protocol';
+import { createSignaling, type ServerMsg, type Signaling } from './signaling';
 import { SpeedMeter } from './speed';
 import type { Sink, SinkFactory } from './sinks';
 
@@ -41,6 +55,12 @@ export interface JoinSnapshot {
   downloading: boolean;
   /** Bytes still to come across all queued and active downloads. */
   remaining: number;
+  /** Host's playback state; receivedAt (performance.now()) lets the UI extrapolate the position. */
+  watch: (WatchState & { receivedAt: number }) | null;
+  chat: ChatMessage[];
+  /** Bumped whenever the incoming media tracks change. */
+  mediaVersion: number;
+  name: string;
 }
 
 interface Download {
@@ -63,6 +83,7 @@ export interface RoomLink {
   roomId: string;
   linkKey: string;
   needsPassword: boolean;
+  kind: RoomKind;
 }
 
 export const NETWORK_MESSAGE =
@@ -75,10 +96,30 @@ export function parseRoomLink(loc: { pathname: string; hash: string } = location
   const m = loc.pathname.match(/^\/r\/([A-Za-z0-9_-]{10,64})\/?$/);
   if (!m) return null;
   const params = new URLSearchParams(loc.hash.replace(/^#/, ''));
-  return { roomId: m[1], linkKey: params.get('k') || '', needsPassword: params.get('p') === '1' };
+  return {
+    roomId: m[1],
+    linkKey: params.get('k') || '',
+    needsPassword: params.get('p') === '1',
+    kind: params.get('m') === 'w' ? 'watch' : 'files',
+  };
 }
 
-function deviceName(): string {
+/**
+ * Ask the sender for stereo, high-bitrate Opus. WebRTC defaults to mono voice
+ * settings, which sound flat for films and music.
+ */
+function preferHifiOpus(sdp: string): string {
+  const pt = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/i)?.[1];
+  if (!pt) return sdp;
+  return sdp.replace(new RegExp(`a=fmtp:${pt} ([^\\r\\n]*)`), (_line, params: string) => {
+    const kept = params
+      .split(';')
+      .filter((p) => p && !/^(stereo|sprop-stereo|maxaveragebitrate|usedtx)=/.test(p.trim()));
+    return `a=fmtp:${pt} ${[...kept, 'stereo=1', 'sprop-stereo=1', 'maxaveragebitrate=256000', 'usedtx=0'].join(';')}`;
+  });
+}
+
+export function deviceName(): string {
   const ua = navigator.userAgent;
   const browser = /Edg\//.test(ua)
     ? 'Edge'
@@ -132,7 +173,7 @@ export class JoinRoom extends Observable<JoinSnapshot> {
   #speed = new SpeedMeter();
   #clientId = stableClientId();
 
-  #sig: SignalingClient | null = null;
+  #sig: Signaling | null = null;
   #pc: RTCPeerConnection | null = null;
   #ctrl: RTCDataChannel | null = null;
   #queuedIce: RTCIceCandidateInit[] = [];
@@ -144,20 +185,51 @@ export class JoinRoom extends Observable<JoinSnapshot> {
   #retryTimer?: ReturnType<typeof setTimeout>;
   #stallTimer: ReturnType<typeof setInterval>;
 
-  static async open(link: RoomLink, password?: string): Promise<JoinRoom> {
+  // Watch-together
+  /** Incoming video/audio from the host. Stable object; its tracks change on reconnect. */
+  readonly media = new MediaStream();
+  #mediaVersion = 0;
+  #watch: (WatchState & { receivedAt: number }) | null = null;
+  #chat: ChatMessage[] = [];
+  #name: string;
+
+  static async open(link: RoomLink, password?: string, name?: string): Promise<JoinRoom> {
     if (!link.linkKey) throw new Error('This link is missing its key. Ask for the full link, including the part after #.');
     const key = await deriveRoomKey(link.linkKey, password);
-    const room = new JoinRoom(link.roomId, key);
+    const room = new JoinRoom(link.roomId, key, name);
     await room.worker.init(key);
     room.#connect();
     return room;
   }
 
-  private constructor(roomId: string, key: CryptoKey) {
+  private constructor(roomId: string, key: CryptoKey, name?: string) {
     super();
     this.roomId = roomId;
     this.key = key;
+    this.#name = cleanName(name, deviceName());
     this.#stallTimer = setInterval(() => this.#checkStalls(), 3000);
+  }
+
+  // ---------------------------------------------------------------- watch together
+
+  control(action: PlaybackAction, time?: number) {
+    this.#sendCtrl({ t: 'control', action, time });
+  }
+
+  chat(text: string) {
+    const clean = text.trim().slice(0, MAX_CHAT_LENGTH);
+    if (clean) this.#sendCtrl({ t: 'chat', text: clean });
+  }
+
+  setName(name: string) {
+    this.#name = cleanName(name, deviceName());
+    this.#sendCtrl({ t: 'name', name: this.#name });
+    this.changed();
+  }
+
+  #clearMedia() {
+    for (const t of this.media.getTracks()) this.media.removeTrack(t);
+    this.#mediaVersion++;
   }
 
   snapshot(): JoinSnapshot {
@@ -175,6 +247,10 @@ export class JoinRoom extends Observable<JoinSnapshot> {
       speed: this.#speed.rate(),
       downloading: [...this.#downloads.values()].some((d) => d.status === 'active' || d.status === 'queued'),
       remaining,
+      watch: this.#watch,
+      chat: this.#chat,
+      mediaVersion: this.#mediaVersion,
+      name: this.#name,
     };
   }
 
@@ -193,7 +269,7 @@ export class JoinRoom extends Observable<JoinSnapshot> {
   async #connect() {
     this.#teardown();
     this.#setStatus(this.#everConnected ? 'reconnecting' : 'connecting');
-    const sig = new SignalingClient(config.signalingUrl);
+    const sig = createSignaling();
     sig.on('message', (m) => this.#onServer(sig, m));
     sig.on('close', () => this.#onSignalingClose(sig));
     this.#sig = sig;
@@ -245,6 +321,7 @@ export class JoinRoom extends Observable<JoinSnapshot> {
     this.#sig = null;
     if (this.#ctrl) this.#ctrl.onclose = null;
     this.#ctrl = null;
+    if (this.#pc) this.#clearMedia();
     this.#pc?.close();
     this.#pc = null;
     this.#queuedIce = [];
@@ -257,11 +334,11 @@ export class JoinRoom extends Observable<JoinSnapshot> {
     sealJson(this.key, msg, aadSignal(this.roomId)).then((box) => sig.send({ type: 'signal', data: { box: toB64u(box) } }));
   }
 
-  #onServer(sig: SignalingClient, m: ServerMsg) {
+  #onServer(sig: Signaling, m: ServerMsg) {
     if (sig !== this.#sig) return;
     switch (m.type) {
       case 'joined':
-        this.#sendSignal({ t: 'hello', clientId: this.#clientId, name: deviceName() });
+        this.#sendSignal({ t: 'hello', clientId: this.#clientId, name: this.#name });
         if (!this.#everConnected) this.#setStatus('waiting');
         return;
       case 'error':
@@ -296,7 +373,7 @@ export class JoinRoom extends Observable<JoinSnapshot> {
     }
   }
 
-  #onSignalingClose(sig: SignalingClient) {
+  #onSignalingClose(sig: Signaling) {
     if (sig !== this.#sig) return;
     this.#sig = null;
     if (this.#status === 'connected') return; // fine, we only lose ICE restarts
@@ -335,7 +412,8 @@ export class JoinRoom extends Observable<JoinSnapshot> {
     try {
       await pc.setRemoteDescription(sdp);
       for (const c of this.#queuedIce.splice(0)) await pc.addIceCandidate(c).catch(() => {});
-      await pc.setLocalDescription();
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription({ type: 'answer', sdp: preferHifiOpus(answer.sdp ?? '') });
       const d = pc.localDescription!;
       this.#sendSignal({ t: 'answer', sdp: { type: d.type, sdp: d.sdp } });
     } catch (e) {
@@ -348,6 +426,13 @@ export class JoinRoom extends Observable<JoinSnapshot> {
     this.#pc = pc;
     pc.onicecandidate = (ev) => {
       if (ev.candidate) this.#sendSignal({ t: 'ice', candidate: ev.candidate.toJSON() });
+    };
+    pc.ontrack = (ev) => {
+      if (this.#pc !== pc) return;
+      for (const t of this.media.getTracks()) if (t.kind === ev.track.kind) this.media.removeTrack(t);
+      this.media.addTrack(ev.track);
+      this.#mediaVersion++;
+      this.changed();
     };
     pc.ondatachannel = (ev) => {
       const ch = ev.channel;
@@ -419,6 +504,18 @@ export class JoinRoom extends Observable<JoinSnapshot> {
       case 'error': {
         const d = msg.file !== undefined ? this.#downloads.get(msg.file) : undefined;
         if (d) this.#failDownload(d, msg.message);
+        return;
+      }
+      case 'watch':
+        this.#watch = { ...msg.state, receivedAt: performance.now() };
+        this.changed();
+        return;
+      case 'chat': {
+        const fresh = (Array.isArray(msg.messages) ? msg.messages : []).filter((m) => !this.#chat.some((c) => c.id === m.id));
+        if (fresh.length) {
+          this.#chat = [...this.#chat, ...fresh].slice(-300);
+          this.changed();
+        }
         return;
       }
       case 'bye':
