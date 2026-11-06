@@ -25,8 +25,8 @@ npm run dev
 
 Open http://localhost:5173, click **Share files** or **Watch together**, then open the link in
 another tab or browser. `npm run dev` starts the signaling server on :8787 and Vite on :5173
-(Vite proxies `/ws`). `npm run dev:http` runs only Vite, using the same HTTP polling signaling
-as the Vercel deployment (with an in-memory store instead of Redis).
+(Vite proxies `/ws`). `npm run dev:relay` runs only Vite and signals through the public MQTT
+relays, exactly like the Vercel deployment.
 
 ### Testing on your phone
 
@@ -67,6 +67,10 @@ npm run test -w signaling
  encrypted chunks on 3 data channels ─────────────────────────────▶ decrypt, reorder, write
 ```
 
+- **Signaling vs. STUN.** Browsers find their public address with Google's public STUN server
+  (`stun:stun.l.google.com:19302`, override with `VITE_ICE_SERVERS`). STUN never carries
+  messages between browsers, so the handshake itself goes through signaling: our Node server, or
+  public MQTT relays on static hosting.
 - The **receiver drives** the transfer by requesting byte ranges. That one choice gives flow
   control (at most 8 MB outstanding per file), retry, and resume after a reconnect.
 - The **sender** reads and encrypts chunks in a Web Worker and respects `bufferedAmount`
@@ -136,20 +140,20 @@ npm run test -w signaling
 
 ## Deploy
 
-**On Vercel.** Vercel functions can't hold WebSockets, so on Vercel the app uses HTTP polling
-signaling instead: `api/signal.ts` keeps rooms and mailboxes in Upstash Redis with ~30-60 s
-expiry (only sealed ciphertext is stored, and it disappears on its own). The client polls from a
-Web Worker every 0.5 s during a handshake and every 2.5 s otherwise; builds on Vercel switch to
-this mode automatically.
+**On Vercel (static site, no server of your own).** Vercel can't run the WebSocket server, so
+builds there use *relay signaling*: the browsers exchange the handshake through free public MQTT
+brokers (EMQX and HiveMQ, both at once for redundancy). Nothing else is needed: no functions,
+no database, no environment variables. Import the GitHub repo in Vercel (or `vercel link` +
+`vercel deploy --prod`); `vercel.json` sets the build, output folder, room-link rewrite and
+security headers.
 
-1. Import the GitHub repo in Vercel (or `vercel link` + `vercel deploy --prod`). `vercel.json`
-   sets the build, output folder, room-link rewrite and security headers.
-2. In the project's **Storage** tab, create an **Upstash for Redis** database (free tier) and
-   connect it to the project. It adds `KV_REST_API_URL` / `KV_REST_API_TOKEN`.
-3. Redeploy so the function picks up those variables.
-
-Each open room costs a few Redis commands per poll (roughly 7k commands per hour for an idle
-host), so check Upstash's free-tier limits if you leave rooms open for long.
+What the brokers see: a topic name derived from the room id *and* the link key (so the room URL
+alone, e.g. from access logs, doesn't reveal it), random peer ids, and handshake payloads that
+are already sealed with the room key. They never see file names, keys or content. The host's
+browser plays the room-server role (tracking joins), and a broker "last will" message tells
+joiners when the host's tab disappears. To use other brokers, set `VITE_RELAY_BROKERS` (comma
+separated `wss://` URLs) and update `connect-src` in `vercel.json`. To build any static
+deployment this way, set `VITE_SIGNALING_MODE=relay`.
 
 **Option A: one Node process** (simplest self-hosting). The signaling server also serves `web/dist`.
 
@@ -197,15 +201,13 @@ encrypted end to end).
 ## Project layout
 
 ```
-api/signal.ts              Vercel function: HTTP polling signaling
-api/_lib/signal-core.ts    room protocol over a key-value store (+ in-memory store for dev)
-api/_lib/store-upstash.ts  Upstash Redis store
 signaling/server.js        WebSocket signaling: rooms in memory, limits, optional static hosting
 signaling/test.js          smoke test for the room protocol
 web/src/lib/engine/        transfer engine (framework-free)
   host.ts                  HostRoom: files, media tracks, approvals, per-peer sender
   join.ts                  JoinRoom: connection state machine, range requests, resume, media
-  signaling.ts             WebSocket and HTTP-polling transports (signalWorker.ts polls)
+  signaling.ts             transport choice + WebSocket transport
+  relaySignaling.ts mqtt.ts  relay transport over public MQTT brokers (tiny MQTT client)
   worker.ts                file reading + AES-GCM off the main thread
   crypto.ts protocol.ts    keys, sealing, frame format, message types
   sinks.ts                 File System Access / service-worker stream / Blob writers

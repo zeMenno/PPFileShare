@@ -8,9 +8,9 @@
       "port": 8787
     },
     {
-      "name": "dev-http",
+      "name": "dev-relay",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev:http"],
+      "runtimeArgs": ["run", "dev:relay"],
       "port": 5173
     },
     {

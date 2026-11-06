@@ -9,17 +9,12 @@
   "scripts": {
     "dev": "concurrently -k -n sig,web -c magenta,cyan \"npm run dev -w signaling\" \"npm run dev -w web\"",
     "dev:lan": "concurrently -k -n sig,web -c magenta,cyan \"npm run dev -w signaling\" \"npm run dev:lan -w web\"",
-    "dev:http": "npm run dev:http -w web",
+    "dev:relay": "npm run dev:relay -w web",
     "build": "npm run build -w web",
     "check": "npm run check -w web",
     "start": "npm run start -w signaling"
   },
   "devDependencies": {
-    "@types/node": "^26.6.6",
-    "concurrently": "^10.0.6",
-    "typescript": "^7.0.2"
-  },
-  "dependencies": {
-    "@upstash/redis": "^1.41.0"
+    "concurrently": "^10.0.6"
   }
 }

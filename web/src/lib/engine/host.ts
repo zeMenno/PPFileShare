@@ -154,10 +154,13 @@ export class HostRoom extends Observable<HostSnapshot> {
     return room;
   }
 
+  readonly linkKey: string;
+
   private constructor(roomId: string, linkKey: string, key: CryptoKey, options: HostOptions) {
     super();
     this.roomId = roomId;
     this.key = key;
+    this.linkKey = linkKey;
     this.#options = { ...options };
     this.kind = options.kind;
     const frag = `k=${linkKey}${options.password ? '&p=1' : ''}${options.kind === 'watch' ? '&m=w' : ''}`;
@@ -345,7 +348,7 @@ export class HostRoom extends Observable<HostSnapshot> {
   // ---------------------------------------------------------------- signaling
 
   async #connectSignaling() {
-    const sig = createSignaling();
+    const sig = createSignaling(this.linkKey);
     sig.on('message', (m) => this.#onServer(m));
     sig.on('close', () => this.#onSignalingLost(sig));
     await sig.connect();
@@ -408,7 +411,13 @@ export class HostRoom extends Observable<HostSnapshot> {
         return;
       case 'error':
         if (this.#pendingCreate) {
-          this.#pendingCreate.reject(new Error(`Could not open the room (${m.code}).`));
+          this.#pendingCreate.reject(
+            new Error(
+              m.code === 'unreachable'
+                ? "Couldn't reach the public signaling relays. Check your internet connection and try again."
+                : `Could not open the room (${m.code}).`,
+            ),
+          );
           this.#pendingCreate = null;
         }
         return;

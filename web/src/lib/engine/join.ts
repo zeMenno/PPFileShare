@@ -196,16 +196,19 @@ export class JoinRoom extends Observable<JoinSnapshot> {
   static async open(link: RoomLink, password?: string, name?: string): Promise<JoinRoom> {
     if (!link.linkKey) throw new Error('This link is missing its key. Ask for the full link, including the part after #.');
     const key = await deriveRoomKey(link.linkKey, password);
-    const room = new JoinRoom(link.roomId, key, name);
+    const room = new JoinRoom(link.roomId, link.linkKey, key, name);
     await room.worker.init(key);
     room.#connect();
     return room;
   }
 
-  private constructor(roomId: string, key: CryptoKey, name?: string) {
+  readonly linkKey: string;
+
+  private constructor(roomId: string, linkKey: string, key: CryptoKey, name?: string) {
     super();
     this.roomId = roomId;
     this.key = key;
+    this.linkKey = linkKey;
     this.#name = cleanName(name, deviceName());
     this.#stallTimer = setInterval(() => this.#checkStalls(), 3000);
   }
@@ -269,7 +272,7 @@ export class JoinRoom extends Observable<JoinSnapshot> {
   async #connect() {
     this.#teardown();
     this.#setStatus(this.#everConnected ? 'reconnecting' : 'connecting');
-    const sig = createSignaling();
+    const sig = createSignaling(this.linkKey);
     sig.on('message', (m) => this.#onServer(sig, m));
     sig.on('close', () => this.#onSignalingClose(sig));
     this.#sig = sig;
